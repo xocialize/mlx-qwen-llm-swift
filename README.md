@@ -1,0 +1,38 @@
+# mlx-qwen-llm-swift
+
+An [MLXEngine](https://github.com/xocialize/mlx-engine-swift) model package exposing the **`llm`**
+capability over Qwen3.5 (default: 0.8B, 8-bit) on Apple silicon via
+[mlx-swift-lm](https://github.com/ml-explore/mlx-swift-lm).
+
+It conforms to the `ModelPackage` contract in `MLXToolKit`: a `PackageManifest` (capabilities,
+requirements per quant, license), lazy `load()`, and a `run()` that maps the canonical
+`LLMRequest`/`LLMResponse` to an MLX `ChatSession` with multi-turn history. The
+`MLXServeEngine` coordinator handles licensing, device eligibility, and memory budgeting.
+
+## Models
+
+`QwenModel.allPublished` catalogs the supported Qwen3.5 sizes × quants; consumers select one
+through `QwenLLMConfiguration`. Weights download on first use from the configured Hugging Face repo.
+
+## Usage
+
+```swift
+import MLXServeCore
+import MLXQwenLLM
+
+let engine = MLXServeEngine()
+try await engine.register(QwenLLMPackage.registration, configuration: QwenLLMConfiguration())
+try await engine.prepare(.llm)
+let response = try await engine.run(LLMRequest(messages: [.init(role: .user, content: "Hi")]))
+```
+
+## Development
+
+This package is co-developed inside the MLXEngine workspace and currently depends on the engine via
+a local path (`../mlx-engine-swift`). For standalone consumption, switch that to a tagged release of
+`mlx-engine-swift`.
+
+## License
+
+MIT — the Swift port. Qwen3.5 weights are licensed by their publisher (Apache-2.0); review the
+model card before redistribution.

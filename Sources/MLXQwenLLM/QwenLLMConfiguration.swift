@@ -4,7 +4,7 @@ import MLXToolKit
 /// Init-time configuration for `QwenLLMPackage` (C9). Carries the chosen checkpoint
 /// (size × quant) and an optional pinned revision; everything that changes call-to-call
 /// (prompt, sampling, mode) rides the `LLMRequest`, never here.
-public struct QwenLLMConfiguration: PackageConfiguration {
+public struct QwenLLMConfiguration: PackageConfiguration, ModelStorable {
     /// Which Qwen3.5 checkpoint to materialize and load.
     public var model: QwenModel
     /// Pinned weights revision (commit/tag). `nil` resolves to the repo default.

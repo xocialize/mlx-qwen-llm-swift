@@ -26,7 +26,7 @@ extension Quant {
         case .int4: return "4bit"
         case .int8: return "8bit"
         case .bf16: return "bf16"
-        case .fp16, .mxfp4: return nil
+        case .fp16, .fp32, .mxfp4: return nil
         }
     }
 
@@ -36,6 +36,7 @@ extension Quant {
         case .int4, .mxfp4: return 0.5
         case .int8:         return 1.0
         case .bf16, .fp16:  return 2.0
+        case .fp32:         return 4.0
         }
     }
 }

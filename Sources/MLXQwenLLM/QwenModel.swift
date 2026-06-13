@@ -26,7 +26,7 @@ extension Quant {
         case .int4: return "4bit"
         case .int8: return "8bit"
         case .bf16: return "bf16"
-        case .fp16, .fp32, .mxfp4: return nil
+        case .fp16, .fp32, .mxfp4, .int5, .int6: return nil
         }
     }
 
@@ -34,6 +34,8 @@ extension Quant {
     fileprivate var bytesPerWeight: Double {
         switch self {
         case .int4, .mxfp4: return 0.5
+        case .int5:         return 0.625
+        case .int6:         return 0.75
         case .int8:         return 1.0
         case .bf16, .fp16:  return 2.0
         case .fp32:         return 4.0

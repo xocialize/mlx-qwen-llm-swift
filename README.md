@@ -28,9 +28,9 @@ let response = try await engine.run(LLMRequest(messages: [.init(role: .user, con
 
 ## Development
 
-This package is co-developed inside the MLXEngine workspace and currently depends on the engine via
-a local path (`../mlx-engine-swift`). For standalone consumption, switch that to a tagged release of
-`mlx-engine-swift`.
+This package is co-developed inside the MLXEngine workspace and consumes the engine as a tagged-URL
+net dependency (`.package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.3.0")`), so
+it builds standalone without a local checkout.
 
 ## License
 

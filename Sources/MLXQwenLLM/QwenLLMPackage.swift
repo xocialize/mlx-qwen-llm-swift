@@ -7,7 +7,8 @@ import MLXHuggingFace
 import HuggingFace
 import Tokenizers
 
-/// The first MLXEngine package: a Qwen3.5 (4-bit) model exposing the canonical `llm` surface.
+/// The first MLXEngine package: a Qwen3.5 model (default 0.8B, 8-bit) exposing the canonical
+/// `llm` surface.
 ///
 /// One `ModelPackage`, one surface. The engine owns the lifecycle (inversion of control): it
 /// constructs this from a `QwenLLMConfiguration`, pages weights in with `load()`, drives
@@ -15,8 +16,8 @@ import Tokenizers
 /// (the class is annotated), so C13 ("runs only in the serialization domain, no private queue")
 /// is compiler-enforced and no internal locking is needed.
 ///
-/// PHASE A: inference is stubbed (see the `TODO(Phase B)` markers). The conformance, manifest,
-/// and registration are real. PHASE B wires `load()`/`run()` to the MLX-Swift LM runtime.
+/// `load()`/`run()` are wired to the MLX-Swift LM runtime: `load()` pages weights via the HF
+/// loader, `run(_:)` maps the canonical request onto a `ChatSession` and returns canonical text.
 @InferenceActor
 public final class QwenLLMPackage: ModelPackage {
     public typealias Configuration = QwenLLMConfiguration
@@ -44,7 +45,7 @@ public final class QwenLLMPackage: ModelPackage {
             surfaces: [
                 LLMContract.descriptor(
                     name: "qwen3.5-llm",
-                    summary: "Qwen3.5 text generation (MLX, 4-bit).",
+                    summary: "Qwen3.5 text generation (MLX).",
                     modes: [.direct, .thinking]
                 )
             ]
@@ -121,12 +122,18 @@ public final class QwenLLMPackage: ModelPackage {
         let prompt = conversational.last?.content ?? ""
         let priorTurns = conversational.isEmpty ? [] : Array(conversational.dropLast())
 
+        // Mode → chat-template kwargs. Additive: a `nil` mode injects nothing, so existing
+        // callers are byte-for-byte unchanged; only an explicit `.direct`/`.companion`/`.thinking`
+        // sets `enable_thinking` on the Qwen3.5 hybrid-reasoner template.
+        let templateContext = Self.templateContext(for: llm.mode)
+
         let text = try await Self.generate(
             container: container,
             instructions: instructions.isEmpty ? nil : instructions,
             history: priorTurns,
             prompt: prompt,
-            parameters: parameters
+            parameters: parameters,
+            additionalContext: templateContext
         )
         return LLMResponse(text: text, finishReason: .stop)
     }
@@ -141,7 +148,8 @@ public final class QwenLLMPackage: ModelPackage {
         instructions: String?,
         history: [ChatMessage],
         prompt: String,
-        parameters: GenerateParameters
+        parameters: GenerateParameters,
+        additionalContext: [String: any Sendable]? = nil
     ) async throws -> String {
         let chatHistory: [Chat.Message] = history.map { message in
             switch message.role {
@@ -153,9 +161,24 @@ public final class QwenLLMPackage: ModelPackage {
             container,
             instructions: instructions,
             history: chatHistory,
-            generateParameters: parameters
+            generateParameters: parameters,
+            additionalContext: additionalContext
         )
         return try await session.respond(to: prompt)
+    }
+
+    /// Maps the canonical `Mode` tag onto Qwen3.5 chat-template kwargs. Qwen3.5 is a hybrid
+    /// reasoner whose template emits `<think>…</think>` unless told otherwise:
+    /// `.direct`/`.companion` disable thinking, `.thinking` enables it. A `nil` (or any other)
+    /// mode returns `nil` so nothing is injected — keeping the change additive for callers that
+    /// don't opt in. `enable_thinking` is the Qwen-family kwarg; other families would map their own.
+    private nonisolated static func templateContext(for mode: Mode?) -> [String: any Sendable]? {
+        guard let mode else { return nil }
+        switch mode {
+        case .direct, .companion: return ["enable_thinking": false]
+        case .thinking:           return ["enable_thinking": true]
+        default:                  return nil
+        }
     }
 }
 

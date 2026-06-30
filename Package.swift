@@ -24,7 +24,7 @@ let package = Package(
         .library(name: "MLXQwenLLM", targets: ["MLXQwenLLM"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.3.0"),
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.15.0"),
         // MLX-Swift LM runtime (https://github.com/ml-explore/mlx-swift-lm):
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.3")),
         // mlx-swift-lm 3.x decoupled the HF stack — the download macro/tokenizer needs these

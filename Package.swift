@@ -27,6 +27,9 @@ let package = Package(
         .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.15.0"),
         // MLX-Swift LM runtime (https://github.com/ml-explore/mlx-swift-lm):
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.3")),
+        // mlx-swift, for MLX.Memory.clearCache() in the wrapper's unload(). Pinned to the
+        // revision mlx-swift-lm already resolves (0.31.5) so this adds no new resolution churn.
+        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.5"),
         // mlx-swift-lm 3.x decoupled the HF stack — the download macro/tokenizer needs these
         // provided by the consumer. Versions pinned to a known-good resolved set.
         .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
@@ -37,6 +40,7 @@ let package = Package(
             name: "MLXQwenLLM",
             dependencies: [
                 .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+                .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 // Both factories linked so loadModelContainer auto-dispatches Qwen3.5 by
                 // config.json (text variant lives in MLXLLM, vision variant in MLXVLM).

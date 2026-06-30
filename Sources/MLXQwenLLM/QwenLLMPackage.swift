@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 import MLXToolKit
 import MLXLMCommon
 import MLXLLM
@@ -92,6 +93,7 @@ public final class QwenLLMPackage: ModelPackage {
     /// Release the working set; the instance survives for a later `load()`.
     public func unload() async {
         container = nil
+        MLX.Memory.clearCache()   // release the retained MLX pool so eviction frees RSS (not just drop refs)
     }
 
     /// Run one `llm` call. Dispatches on capability, decodes the canonical request, generates

@@ -7,6 +7,7 @@ import MLXVLM
 import MLXHuggingFace
 import HuggingFace
 import Tokenizers
+import os
 
 /// The first MLXEngine package: a Qwen3.5 model (default 0.8B, 8-bit) exposing the canonical
 /// `llm` surface.
@@ -19,6 +20,18 @@ import Tokenizers
 ///
 /// `load()`/`run()` are wired to the MLX-Swift LM runtime: `load()` pages weights via the HF
 /// loader, `run(_:)` maps the canonical request onto a `ChatSession` and returns canonical text.
+///
+/// **KV-cache reuse (prompt caching).** The package holds ONE `ChatSession` across `run(_:)`
+/// calls. When an incoming request is exactly the held session's transcript plus one new user
+/// turn (see `SessionReuse.decision`), only that turn is sent — the session's retained
+/// `[KVCache]` already encodes the prefix, so per-turn latency and the prefill-scratch
+/// transient stay flat instead of growing with conversation length (measured 2.1 GB @2k →
+/// 7 GB @8k prefill scratch on 0.8B-8bit; GatedDeltaNet chunked-scan). Any mismatch rebuilds a
+/// fresh session (the pre-reuse behavior). **Memory triage note:** the retained KV cache (plus
+/// the GatedDeltaNet recurrent state) is *intentional* active-memory retention that grows with
+/// the conversation — `gpuPoolSnapshot` "active climbing across turns" while this package is
+/// chatting is expected, not a leak; it is dropped on `unload()` (eviction) and on any
+/// transcript mismatch.
 @InferenceActor
 public final class QwenLLMPackage: ModelPackage {
     public typealias Configuration = QwenLLMConfiguration
@@ -57,6 +70,24 @@ public final class QwenLLMPackage: ModelPackage {
     /// The resident model + tokenizer, paged in by `load()`. `nil` until loaded.
     private var container: ModelContainer?
 
+    /// The held multi-turn session whose KV cache encodes `held.transcript`. `nil` until the
+    /// first eligible run; dropped on `unload()`, on any transcript mismatch, and on any error
+    /// mid-generation (a throw can leave the KV cache with a partially appended turn the
+    /// transcript doesn't record — reusing it would be a silent-corruption false positive).
+    private var held: HeldChatSession?
+
+    /// Escape hatch + A/B seam: `false` forces a fresh session per run (the pre-reuse
+    /// behavior). Used by the `RunQwenLLM --kv-reuse` gate to produce the baseline leg.
+    public var kvCacheReuseEnabled = true
+
+    /// KV-reuse observability: cumulative counts since load. Surfaced so a consuming app can
+    /// verify its hit rate in situ; each run also logs a HIT/MISS line via `Logger`
+    /// (subsystem `MLXQwenLLM`, category `kv-reuse`).
+    public private(set) var kvReuseHits = 0
+    public private(set) var kvReuseMisses = 0
+
+    private nonisolated static let log = Logger(subsystem: "MLXQwenLLM", category: "kv-reuse")
+
     /// Cheap construction — no compute, no weight paging (C13). Residency is `load()`'s job.
     public nonisolated init(configuration: Configuration) {
         self.configuration = configuration
@@ -92,6 +123,7 @@ public final class QwenLLMPackage: ModelPackage {
 
     /// Release the working set; the instance survives for a later `load()`.
     public func unload() async {
+        held = nil                // the retained KV cache goes with the weights (its intended lifetime)
         container = nil
         MLX.Memory.clearCache()   // release the retained MLX pool so eviction frees RSS (not just drop refs)
     }
@@ -112,61 +144,117 @@ public final class QwenLLMPackage: ModelPackage {
         if let topP = llm.parameters.topP { parameters.topP = Float(topP) }
         parameters.maxTokens = llm.parameters.maxTokens
 
-        // System turns become session instructions.
-        let instructions = llm.messages
-            .filter { $0.role == .system }
-            .map(\.content)
-            .joined(separator: "\n\n")
-
-        // Multi-turn: seed every prior non-system turn as history, respond to the final user turn.
-        // A single message yields empty history (same as one-shot).
-        let conversational = llm.messages.filter { $0.role != .system }
-        let prompt = conversational.last?.content ?? ""
-        let priorTurns = conversational.isEmpty ? [] : Array(conversational.dropLast())
-
         // Mode → chat-template kwargs. Additive: a `nil` mode injects nothing, so existing
         // callers are byte-for-byte unchanged; only an explicit `.direct`/`.companion`/`.thinking`
         // sets `enable_thinking` on the Qwen3.5 hybrid-reasoner template.
         let templateContext = Self.templateContext(for: llm.mode)
 
-        let text = try await Self.generate(
-            container: container,
-            instructions: instructions.isEmpty ? nil : instructions,
-            history: priorTurns,
-            prompt: prompt,
-            parameters: parameters,
-            additionalContext: templateContext
-        )
+        let incoming = SessionTranscript(messages: llm.messages)
+        let decision = kvCacheReuseEnabled
+            ? SessionReuse.decision(held: held?.transcript, incoming: incoming)
+            : .rebuild
+
+        let text: String
+        if case .reuse(let newUserTurn) = decision, let session = held {
+            // Cache hit: the held KV cache encodes everything but this turn, so send ONLY the
+            // new turn (TokenIterator appends the full templated input at the cache offset —
+            // no prefix dedupe). Take the box out first: if respond throws, `held` stays nil
+            // and the next run rebuilds instead of reusing a partially-appended cache.
+            held = nil
+            kvReuseHits += 1
+            Self.log.debug("HIT — appending 1 turn at cache offset (hits=\(self.kvReuseHits) misses=\(self.kvReuseMisses))")
+            text = try await Self.respond(in: session,
+                                          to: newUserTurn,
+                                          parameters: parameters,
+                                          additionalContext: templateContext)
+            session.transcript.turns.append(ChatMessage(role: .user, content: newUserTurn))
+            session.transcript.turns.append(ChatMessage(role: .assistant, content: text))
+            held = session
+        } else {
+            // Fresh session (first turn, reuse disabled, or transcript mismatch): seed every
+            // prior non-system turn as history and respond to the final turn — the pre-reuse
+            // behavior, byte-identical templating. A single message yields empty history.
+            held = nil
+            kvReuseMisses += 1
+            Self.log.debug("MISS — fresh session, prefilling \(incoming.turns.count) turn(s) (hits=\(self.kvReuseHits) misses=\(self.kvReuseMisses))")
+            let prompt = incoming.turns.last?.content ?? ""
+            let priorTurns = incoming.turns.isEmpty ? [] : Array(incoming.turns.dropLast())
+            let session = Self.startSession(container: container,
+                                            systemPrompt: incoming.systemPrompt,
+                                            priorTurns: priorTurns,
+                                            parameters: parameters,
+                                            additionalContext: templateContext)
+            text = try await Self.respond(in: session,
+                                          to: prompt,
+                                          parameters: parameters,
+                                          additionalContext: templateContext)
+            // Hold the session for reuse only when the turn we just answered really was a user
+            // turn — a trailing assistant/degenerate turn was *templated as user* in this
+            // session's KV, so a later fresh rebuild (which templates it by its true role)
+            // would diverge from the cache. Not holding keeps those callers on today's path.
+            // The responded turn is dropLast'd out of `priorTurns`, so record it here too.
+            if let lastTurn = incoming.turns.last, lastTurn.role == .user {
+                session.transcript.turns.append(lastTurn)
+                session.transcript.turns.append(ChatMessage(role: .assistant, content: text))
+                held = session
+            }
+        }
         return LLMResponse(text: text, finishReason: .stop)
     }
 
-    /// Runs one generation on a fresh `ChatSession`. `ChatSession` is not `Sendable` (and not
-    /// thread-safe), so it is created and consumed entirely inside this `nonisolated` helper from
-    /// `Sendable` inputs — it never crosses the `InferenceActor` isolation boundary (which would
-    /// otherwise trip the "sending risks data races" check). `ModelContainer` provides its own
-    /// internal isolation.
-    private nonisolated static func generate(
+    /// Builds the held session for one conversation. The system prompt seeds `history[0]`
+    /// rather than the `instructions:` parameter — `ChatSession` re-templates instructions
+    /// into the KV stream on EVERY `respond()`, which would desync a held cache; a history
+    /// `.system` turn is templated exactly once (and yields the same templated bytes).
+    ///
+    /// `ChatSession` is not `Sendable` (and not thread-safe), so it is created inside this
+    /// `nonisolated` helper from `Sendable` inputs and handed back only inside the
+    /// `@unchecked Sendable` `HeldChatSession` box — it never crosses the `InferenceActor`
+    /// isolation boundary unboxed (which would trip the "sending risks data races" check).
+    /// `ModelContainer` provides its own internal isolation.
+    private nonisolated static func startSession(
         container: ModelContainer,
-        instructions: String?,
-        history: [ChatMessage],
-        prompt: String,
+        systemPrompt: String,
+        priorTurns: [ChatMessage],
         parameters: GenerateParameters,
-        additionalContext: [String: any Sendable]? = nil
-    ) async throws -> String {
-        let chatHistory: [Chat.Message] = history.map { message in
+        additionalContext: [String: any Sendable]?
+    ) -> HeldChatSession {
+        var history: [Chat.Message] = []
+        if !systemPrompt.isEmpty {
+            history.append(.system(systemPrompt))
+        }
+        history.append(contentsOf: priorTurns.map { message in
             switch message.role {
             case .assistant: return .assistant(message.content)
             case .user, .system: return .user(message.content)
             }
-        }
+        })
         let session = ChatSession(
             container,
-            instructions: instructions,
-            history: chatHistory,
+            instructions: nil,
+            history: history,
             generateParameters: parameters,
             additionalContext: additionalContext
         )
-        return try await session.respond(to: prompt)
+        return HeldChatSession(
+            session: session,
+            transcript: SessionTranscript(systemPrompt: systemPrompt, turns: priorTurns))
+    }
+
+    /// Runs one generation on the boxed session. `generateParameters` and `additionalContext`
+    /// are mutable vars on `ChatSession`, captured per `respond()` call — refreshing them here
+    /// lets sampling and mode (`enable_thinking`) change across turns of a HELD session without
+    /// forcing a rebuild. (Neither affects KV-cache structure: the cache-shaping knobs —
+    /// kvBits/maxKVSize — are never set by this package.)
+    private nonisolated static func respond(
+        in held: HeldChatSession,
+        to prompt: String,
+        parameters: GenerateParameters,
+        additionalContext: [String: any Sendable]?
+    ) async throws -> String {
+        held.session.generateParameters = parameters
+        held.session.additionalContext = additionalContext
+        return try await held.session.respond(to: prompt)
     }
 
     /// Maps the canonical `Mode` tag onto Qwen3.5 chat-template kwargs. Qwen3.5 is a hybrid
@@ -181,6 +269,26 @@ public final class QwenLLMPackage: ModelPackage {
         case .thinking:           return ["enable_thinking": true]
         default:                  return nil
         }
+    }
+}
+
+/// The held cross-`run` `ChatSession` plus the exact transcript its KV cache encodes.
+///
+/// `@unchecked Sendable`: `ChatSession` is not `Sendable` (not thread-safe), but every touch is
+/// serialized — the box lives on the `@InferenceActor` package, whose lifecycle the engine
+/// drives in one serialization domain (C13), and the session inside is only used by the
+/// package's `nonisolated` helpers, one call at a time. The box exists so the session reference
+/// can be stored on the actor across runs and still be passed to those helpers without tripping
+/// Swift 6's region-isolation "sending 'session' risks causing data races" check.
+final class HeldChatSession: @unchecked Sendable {
+    let session: ChatSession
+    /// What the session's KV cache encodes; compared (exactly) against each incoming request
+    /// by `SessionReuse.decision`. Mutated only on the `InferenceActor`.
+    var transcript: SessionTranscript
+
+    init(session: ChatSession, transcript: SessionTranscript) {
+        self.session = session
+        self.transcript = transcript
     }
 }
 

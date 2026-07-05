@@ -52,6 +52,16 @@ let package = Package(
                 .product(name: "Tokenizers", package: "swift-transformers"),
             ]
         ),
+        // Live gates (GPU inference runs here, not in the SPM test product, whose metallib is
+        // unreliable — the fleet CLI-gate convention): --smoke / --kv-reuse / --mem-bench.
+        .executableTarget(
+            name: "RunQwenLLM",
+            dependencies: [
+                "MLXQwenLLM",
+                .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+                .product(name: "MLX", package: "mlx-swift"),
+            ]
+        ),
         .testTarget(
             name: "MLXQwenLLMTests",
             dependencies: [

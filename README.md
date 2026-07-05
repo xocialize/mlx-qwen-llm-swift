@@ -9,6 +9,23 @@ requirements per quant, license), lazy `load()`, and a `run()` that maps the can
 `LLMRequest`/`LLMResponse` to an MLX `ChatSession` with multi-turn history. The
 `MLXServeEngine` coordinator handles licensing, device eligibility, and memory budgeting.
 
+The package holds one `ChatSession` across `run()` calls (**KV-cache reuse**): when a request
+is exactly the previous transcript plus one new user turn, only that turn is prefilled —
+per-turn latency and the prefill transient stay flat as a conversation grows. Any transcript
+mismatch falls back to a fresh session. The retained KV cache is intentional active-memory
+retention, dropped on `unload()`; hit/miss counts are exposed (`kvReuseHits`/`kvReuseMisses`)
+and logged (`Logger` subsystem `MLXQwenLLM`, category `kv-reuse`).
+
+## Live gates
+
+GPU gates run via the CLI (fleet convention — not in the SPM test product):
+
+```
+swift run -c release RunQwenLLM --smoke        # one governed-shape generate
+swift run -c release RunQwenLLM --kv-reuse     # reuse correctness A/B + latency + fallback
+swift run -c release RunQwenLLM --mem-bench    # split-footprint + held-KV retention drift
+```
+
 ## Models
 
 `QwenModel.allPublished` catalogs the supported Qwen3.5 sizes × quants; consumers select one

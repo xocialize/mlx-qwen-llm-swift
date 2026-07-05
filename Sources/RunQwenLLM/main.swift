@@ -20,6 +20,12 @@
 //   swift run -c release RunQwenLLM --mem-bench                 split-footprint measurement:
 //       resident floor + activation peak at the documented ~2k-token envelope (phys_footprint,
 //       the governor's basis), plus the held-KV retention drift across a reuse-on conversation.
+//   swift run -c release RunQwenLLM --structured                structured-output gate (N6):
+//       the three companion-shaped prompts (parseFacts → JSON array, parseAffect → JSON
+//       object, decideSearchQuery → JSON object) × N=20 runs at temp 0.7. Asserted: 100%
+//       strict-parse rate + correct top-level container + finishReason==.stop with
+//       responseFormat. Reported: the measured baseline failure rate WITHOUT responseFormat
+//       (companion-style bracket-scrape parsing) and the per-step masking latency overhead.
 //
 //   Optional: --models-root <dir> to point the Hub cache somewhere other than the default
 //   (~/.cache/huggingface/hub, where a prior download already lives on the dev box).
@@ -300,6 +306,161 @@ func memBench(cfg: QwenLLMConfiguration) async throws {
     sampler.stop()
 }
 
+/// The three MLXCompanion call-site shapes that motivated N6, expressed as responseFormat
+/// requests (the exact consumer recipes documented in the ENGINE-NEEDS closure note).
+struct StructuredCase {
+    let name: String
+    let system: String
+    let user: String
+    let format: ResponseFormat
+    /// "object" / "array" — the required top-level container of the parsed value.
+    let expects: String
+}
+
+let structuredCases: [StructuredCase] = [
+    StructuredCase(
+        name: "parseFacts",
+        system: "You extract stable facts about the user from conversation. Respond with ONLY "
+            + "a JSON array of short fact strings. No prose, no code fences.",
+        user: "User said: \"I'm Marisol, I live in Reykjavík with my two cats, and I teach "
+            + "piano on weekends. Lately I've been learning Icelandic.\" Extract the facts.",
+        format: .json(container: .array),
+        expects: "array"),
+    StructuredCase(
+        name: "parseAffect",
+        system: "You read the user's emotional state. Respond with ONLY a JSON object of the "
+            + "shape {\"mood\": string, \"energy\": number 0..1, \"valence\": number -1..1}. "
+            + "No prose.",
+        user: "User said: \"honestly today was a lot. the recital went fine I guess but I'm "
+            + "completely wiped and kind of on edge.\" Read their affect.",
+        format: .json(container: .object),
+        expects: "object"),
+    StructuredCase(
+        name: "decideSearchQuery",
+        system: "You decide whether answering needs a web search. Respond with ONLY a JSON "
+            + "object: {\"action\": \"search\", \"query\": \"<terms>\"} if current information "
+            + "is needed, or {\"action\": \"none\"} if not. No prose.",
+        user: "User asked: \"what's the weather looking like in Reykjavík this weekend?\"",
+        format: .json(container: .object),
+        expects: "object"),
+]
+
+/// Companion-style salvage parse for the BASELINE leg (mirrors the regex-scrape the N6 call
+/// sites do today): try the trimmed text, then the outermost bracket span.
+func scrapeJSON(_ text: String, expects: String) -> Bool {
+    let (open, close): (Character, Character) = expects == "array" ? ("[", "]") : ("{", "}")
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    var candidates = [trimmed]
+    if let a = trimmed.firstIndex(of: open), let b = trimmed.lastIndex(of: close), a < b {
+        candidates.append(String(trimmed[a...b]))
+    }
+    for candidate in candidates {
+        guard let data = candidate.data(using: .utf8),
+              let parsed = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        else { continue }
+        if expects == "array", parsed is [Any] { return true }
+        if expects == "object", parsed is [String: Any] { return true }
+    }
+    return false
+}
+
+/// Strict parse for the CONSTRAINED leg: the entire response must be one valid JSON value of
+/// the requested container. No salvage.
+func strictParse(_ text: String, expects: String) -> Bool {
+    guard let data = text.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
+          let parsed = try? JSONSerialization.jsonObject(with: data) else { return false }
+    if expects == "array" { return parsed is [Any] }
+    return parsed is [String: Any]
+}
+
+@InferenceActor
+func structuredGate(cfg: QwenLLMConfiguration, runs: Int) async throws {
+    var failures: [String] = []
+    let pkg = QwenLLMPackage(configuration: cfg)
+    try await pkg.load()
+
+    // Warmup both paths (kernel compile + the once-per-residency vocab classification),
+    // excluded from every timing below.
+    _ = try await pkg.run(
+        LLMRequest(prompt: "Hi", parameters: LLMParameters(temperature: 0, maxTokens: 8),
+                   mode: .direct))
+    let v0 = Date()
+    _ = try await pkg.run(
+        LLMRequest(prompt: "Say hi as JSON.",
+                   parameters: LLMParameters(temperature: 0, maxTokens: 32),
+                   mode: .direct, responseFormat: .json))
+    print(String(format: "[structured] warmup (incl. one-time vocab classification): %.2fs",
+                 Date().timeIntervalSince(v0)))
+
+    let params = LLMParameters(temperature: 0.7, topP: 0.95, maxTokens: 256)
+    var totalMaskSeconds = 0.0
+    var totalMaskSteps = 0
+
+    for c in structuredCases {
+        var baselineOK = 0
+        var constrainedOK = 0
+        var baselineSecs = 0.0
+        var constrainedSecs = 0.0
+
+        for _ in 0..<runs {
+            let messages = [ChatMessage(role: .system, content: c.system),
+                            ChatMessage(role: .user, content: c.user)]
+
+            // Baseline leg: today's behavior — no responseFormat, companion-style scrape.
+            var t0 = Date()
+            let free = try await pkg.run(
+                LLMRequest(messages: messages, parameters: params, mode: .direct)) as! LLMResponse
+            baselineSecs += Date().timeIntervalSince(t0)
+            if scrapeJSON(free.text, expects: c.expects) { baselineOK += 1 }
+
+            // Constrained leg: strict parse, correct container, honest finishReason.
+            t0 = Date()
+            let structured = try await pkg.run(
+                LLMRequest(messages: messages, parameters: params, mode: .direct,
+                           responseFormat: c.format)) as! LLMResponse
+            constrainedSecs += Date().timeIntervalSince(t0)
+            if strictParse(structured.text, expects: c.expects),
+               structured.finishReason == .stop {
+                constrainedOK += 1
+            } else {
+                print("[structured]   ✗ \(c.name) constrained miss "
+                      + "(finish=\(String(describing: structured.finishReason))): "
+                      + "\(structured.text.prefix(160))")
+            }
+            if let stats = pkg.lastStructuredStats {
+                totalMaskSeconds += stats.maskSeconds
+                totalMaskSteps += stats.steps
+            }
+        }
+
+        print(String(format: "[structured] %-18s baseline(scrape) %2d/%d · constrained(strict) %2d/%d · avg %.2fs vs %.2fs",
+                     (c.name as NSString).utf8String!, baselineOK, runs, constrainedOK, runs,
+                     baselineSecs / Double(runs), constrainedSecs / Double(runs)))
+        if constrainedOK != runs {
+            failures.append("\(c.name): constrained parse rate \(constrainedOK)/\(runs) (must be 100%)")
+        }
+    }
+
+    if totalMaskSteps > 0 {
+        let perStepMs = totalMaskSeconds / Double(totalMaskSteps) * 1000
+        print(String(format: "[structured] masking overhead: %.3f ms/step over %d steps "
+                     + "(decode step on 0.8B-8bit is ~5-15 ms — target: negligible)",
+                     perStepMs, totalMaskSteps))
+        if perStepMs > 5 {
+            failures.append(String(format: "per-step masking overhead %.2f ms is not negligible", perStepMs))
+        }
+    }
+
+    await pkg.unload()
+    if failures.isEmpty {
+        print("[structured] PASS ✅")
+    } else {
+        print("[structured] FAIL ❌")
+        for f in failures { print("[structured]   - \(f)") }
+        exit(1)
+    }
+}
+
 let args = CommandLine.arguments
 var modelsRoot: URL? = nil
 if let i = args.firstIndex(of: "--models-root"), i + 1 < args.count {
@@ -311,10 +472,16 @@ if args.contains("--kv-reuse") {
     try await kvReuseGate(cfg: cfg)
 } else if args.contains("--mem-bench") {
     try await memBench(cfg: cfg)
+} else if args.contains("--structured") {
+    var runs = 20
+    if let i = args.firstIndex(of: "--runs"), i + 1 < args.count, let n = Int(args[i + 1]) {
+        runs = n
+    }
+    try await structuredGate(cfg: cfg, runs: runs)
 } else if args.contains("--smoke") {
     try await smoke(cfg: cfg)
 } else {
-    print("usage: RunQwenLLM --smoke | --kv-reuse | --mem-bench  [--models-root <dir>]")
+    print("usage: RunQwenLLM --smoke | --kv-reuse | --mem-bench | --structured [--runs N]  [--models-root <dir>]")
     print("  model: \(QwenModel.default.displayName) via \(QwenModel.default.weightsRepo ?? "?")")
     print("  weights default to the standard Hub cache (~/.cache/huggingface/hub)")
 }

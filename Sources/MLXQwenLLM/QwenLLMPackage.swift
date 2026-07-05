@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXToolKit
+import MLXConstrainedDecoding
 import MLXLMCommon
 import MLXLLM
 import MLXVLM
@@ -60,7 +61,10 @@ public final class QwenLLMPackage: ModelPackage {
                 LLMContract.descriptor(
                     name: "qwen3.5-llm",
                     summary: "Qwen3.5 text generation (MLX).",
-                    modes: [.direct, .thinking]
+                    modes: [.direct, .thinking],
+                    // Honest C11 advertisement: this package really constrains
+                    // (grammar-masked decode via MLXConstrainedDecoding, contract 1.16.0).
+                    supportsStructuredOutput: true
                 )
             ]
         )
@@ -79,6 +83,16 @@ public final class QwenLLMPackage: ModelPackage {
     /// Escape hatch + A/B seam: `false` forces a fresh session per run (the pre-reuse
     /// behavior). Used by the `RunQwenLLM --kv-reuse` gate to produce the baseline leg.
     public var kvCacheReuseEnabled = true
+
+    /// Vocab classification for constrained decoding (contract 1.16.0 `responseFormat`) —
+    /// built once per residency on the first structured request (a full-vocab pass over the
+    /// tokenizer; not paid by freeform-only consumers), dropped with the weights on `unload()`.
+    private var constrainedVocabulary: TokenVocabulary?
+
+    /// Masking telemetry of the most recent structured run (steps, wall-clock spent in the
+    /// per-step allowed-set computation, simulated candidates) — surfaced for the
+    /// `RunQwenLLM --structured` gate's latency report.
+    public private(set) var lastStructuredStats: JSONConstraintEngine.Stats?
 
     /// KV-reuse observability: cumulative counts since load. Surfaced so a consuming app can
     /// verify its hit rate in situ; each run also logs a HIT/MISS line via `Logger`
@@ -124,6 +138,7 @@ public final class QwenLLMPackage: ModelPackage {
     /// Release the working set; the instance survives for a later `load()`.
     public func unload() async {
         held = nil                // the retained KV cache goes with the weights (its intended lifetime)
+        constrainedVocabulary = nil
         container = nil
         MLX.Memory.clearCache()   // release the retained MLX pool so eviction frees RSS (not just drop refs)
     }
@@ -148,6 +163,18 @@ public final class QwenLLMPackage: ModelPackage {
         // callers are byte-for-byte unchanged; only an explicit `.direct`/`.companion`/`.thinking`
         // sets `enable_thinking` on the Qwen3.5 hybrid-reasoner template.
         let templateContext = Self.templateContext(for: llm.mode)
+
+        // Structured output (contract 1.16.0): bypass ChatSession entirely — mlx-swift-lm
+        // 3.31.x has no processor-injection seam through GenerateParameters/ChatSession, so
+        // the request is templated directly and driven through TokenIterator with the
+        // grammar-masking LogitProcessor and a FRESH cache. Deliberately does not touch
+        // `held`: the companion's structured calls are one-shot side calls, and the
+        // conversational KV-reuse path stays byte-for-byte unchanged.
+        if llm.responseFormat != nil {
+            return try await runStructured(container: container, request: llm,
+                                           parameters: parameters,
+                                           templateContext: templateContext)
+        }
 
         let incoming = SessionTranscript(messages: llm.messages)
         let decision = kvCacheReuseEnabled
@@ -255,6 +282,112 @@ public final class QwenLLMPackage: ModelPackage {
         held.session.generateParameters = parameters
         held.session.additionalContext = additionalContext
         return try await held.session.respond(to: prompt)
+    }
+
+    // MARK: - Structured output (contract 1.16.0, ENGINE-NEEDS N6)
+
+    /// Grammar-constrained generation for `responseFormat` requests.
+    ///
+    /// Templates the full message list via the tokenizer chat template (`UserInput` →
+    /// `UserInputProcessor.prepare`), then drives `TokenIterator` directly with
+    /// `JSONConstrainedLogitProcessor` masking every token that can't extend a valid JSON
+    /// prefix. Generation stops by construction: once the top-level value completes, the
+    /// mask leaves only EOS.
+    private func runStructured(container: ModelContainer,
+                               request llm: LLMRequest,
+                               parameters: GenerateParameters,
+                               templateContext: [String: any Sendable]?) async throws
+        -> LLMResponse {
+        guard let format = llm.responseFormat else {
+            throw PackageError.configurationMismatch(expected: "responseFormat", got: "nil")
+        }
+
+        // Contract format → grammar container. C12: defaults on both additive enums.
+        let grammarContainer: JSONStateMachine.Container
+        switch format {
+        case .json(let container):
+            switch container {
+            case .object: grammarContainer = .object
+            case .array:  grammarContainer = .array
+            case .any:    grammarContainer = .any
+            @unknown default: grammarContainer = .any
+            }
+        case .jsonSchema(let schema):
+            // V1 best-effort lane (documented in the contract): valid-JSON syntax with the
+            // container inferred from the schema root; field shape stays prompt-steered.
+            grammarContainer = JSONSchemaHint.container(fromSchema: schema)
+        @unknown default:
+            throw PackageError.unsupportedRequestFeature(
+                "responseFormat: unrecognized case (package built against an older contract)")
+        }
+
+        // Once-per-residency vocab classification (full-vocab pass over the tokenizer).
+        if constrainedVocabulary == nil {
+            constrainedVocabulary = await container.perform { context in
+                var eosIDs = context.configuration.eosTokenIds
+                if let id = context.tokenizer.eosTokenId { eosIDs.insert(id) }
+                for token in context.configuration.extraEOSTokens {
+                    if let id = context.tokenizer.convertTokenToId(token) { eosIDs.insert(id) }
+                }
+                return TokenVocabulary(
+                    pieceForID: { context.tokenizer.convertIdToToken($0) },
+                    eosTokenIDs: eosIDs)
+            }
+        }
+        guard let vocabulary = constrainedVocabulary else { throw PackageError.notLoaded }
+
+        // Same history mapping as the freeform path (system content hoisted to the front).
+        // `Chat.Message` is not Sendable, so the transcript (which is) crosses into the
+        // `perform` closure and the chat history is materialized inside it.
+        let transcript = SessionTranscript(messages: llm.messages)
+
+        // Thinking is disabled by default on structured calls: `<think>` tags can't be
+        // emitted under the JSON mask anyway (special tokens are excluded), so leaving the
+        // hybrid template in thinking mode would only fight the constraint. An explicit
+        // `.thinking` mode still wins.
+        let kwargs = templateContext ?? ["enable_thinking": false]
+
+        // Unbounded-generation backstop: constrained decode force-stops at the complete
+        // value (or on a grammar dead end), but a pathological in-string ramble could run
+        // until the context window — cap it when the caller didn't.
+        let maxTokens = parameters.maxTokens ?? 2048
+
+        let (text, complete, stats): (String, Bool, JSONConstraintEngine.Stats) =
+            try await container.perform { context in
+                var history: [Chat.Message] = []
+                if !transcript.systemPrompt.isEmpty {
+                    history.append(.system(transcript.systemPrompt))
+                }
+                for turn in transcript.turns {
+                    switch turn.role {
+                    case .assistant: history.append(.assistant(turn.content))
+                    case .user, .system: history.append(.user(turn.content))
+                    }
+                }
+                let input = UserInput(chat: history, additionalContext: kwargs)
+                let lmInput = try await context.processor.prepare(input: input)
+                let engine = JSONConstraintEngine(vocabulary: vocabulary,
+                                                  container: grammarContainer)
+                let processor = JSONConstrainedLogitProcessor(engine: engine)
+                var iterator = try TokenIterator(
+                    input: lmInput, model: context.model, cache: nil,
+                    processor: processor, sampler: parameters.sampler(),
+                    maxTokens: maxTokens)
+                var tokens: [Int] = []
+                while let token = iterator.next() {
+                    if vocabulary.eosTokenIDs.contains(token) { break }
+                    tokens.append(token)
+                    try Task.checkCancellation()   // C13: cooperatively evictable
+                }
+                return (context.tokenizer.decode(tokenIds: tokens),
+                        engine.isComplete, engine.stats)
+            }
+        lastStructuredStats = stats
+
+        // Honest finish reason: `.stop` only when the grammar really completed a top-level
+        // value; a maxTokens truncation mid-value reports `.length` so the caller knows the
+        // text may not parse.
+        return LLMResponse(text: text, finishReason: complete ? .stop : .length)
     }
 
     /// Maps the canonical `Mode` tag onto Qwen3.5 chat-template kwargs. Qwen3.5 is a hybrid

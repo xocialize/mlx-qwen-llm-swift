@@ -24,7 +24,11 @@ let package = Package(
         .library(name: "MLXQwenLLM", targets: ["MLXQwenLLM"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.15.0"),
+        // ≥0.22.0: contract 1.16.0 — LLMRequest.responseFormat (structured output, N6).
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.22.0"),
+        // JSON grammar-constrained decoding (the responseFormat runtime, shared with the
+        // gemma package).
+        .package(url: "https://github.com/xocialize/mlx-constrained-decoding-swift", from: "0.1.0"),
         // MLX-Swift LM runtime (https://github.com/ml-explore/mlx-swift-lm):
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.3")),
         // mlx-swift, for MLX.Memory.clearCache() in the wrapper's unload(). Pinned to the
@@ -40,6 +44,7 @@ let package = Package(
             name: "MLXQwenLLM",
             dependencies: [
                 .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+                .product(name: "MLXConstrainedDecoding", package: "mlx-constrained-decoding-swift"),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 // Both factories linked so loadModelContainer auto-dispatches Qwen3.5 by

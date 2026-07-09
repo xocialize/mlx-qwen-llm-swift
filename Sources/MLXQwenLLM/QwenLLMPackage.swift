@@ -147,11 +147,17 @@ public final class QwenLLMPackage: ModelPackage {
     /// text on the resident model, and returns canonical text. Honors cancellation so the
     /// MemoryGovernor can preempt + requeue.
     public func run(_ request: any CapabilityRequest) async throws -> any CapabilityResponse {
+        // CAN-1: the entry checkpoint is the FIRST act of run() — before notLoaded validation
+        // (engine ≥ 0.27.0). Mid-run cadence: both generation paths bail per generated token —
+        // mlx-swift-lm's generation loop checks Task.isCancelled every token (plain path;
+        // MLXLMCommon/Evaluate.swift tokenLoop, 3.31.4) with the post-respond checkpoint in
+        // `respond(in:to:...)` rethrowing, and the structured TokenIterator drive checks per
+        // token directly.
+        try Task.checkCancellation()
         guard let container else { throw PackageError.notLoaded }
         guard request.capability == .llm, let llm = request as? LLMRequest else {
             throw PackageError.unsupportedCapability(request.capability)
         }
-        try Task.checkCancellation()
 
         // Map canonical sampling controls onto MLX GenerateParameters.
         var parameters = GenerateParameters()
@@ -281,7 +287,15 @@ public final class QwenLLMPackage: ModelPackage {
     ) async throws -> String {
         held.session.generateParameters = parameters
         held.session.additionalContext = additionalContext
-        return try await held.session.respond(to: prompt)
+        let text = try await held.session.respond(to: prompt)
+        // Cancellation seam (CAN-2): on cancel, mlx-swift-lm's generation loop stops per token
+        // (Evaluate.swift checks Task.isCancelled every iteration) but `respond` RETURNS the
+        // partial text instead of throwing. Convert that into the canonical CancellationError
+        // HERE — before the caller records the turn and re-holds the session — so a cancelled
+        // run never re-holds a KV cache with a truncated assistant turn (the caller's
+        // take-the-box-out-first pattern leaves `held` nil when this throws).
+        try Task.checkCancellation()
+        return text
     }
 
     // MARK: - Structured output (contract 1.16.0, ENGINE-NEEDS N6)

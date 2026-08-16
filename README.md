@@ -16,6 +16,13 @@ mismatch falls back to a fresh session. The retained KV cache is intentional act
 retention, dropped on `unload()`; hit/miss counts are exposed (`kvReuseHits`/`kvReuseMisses`)
 and logged (`Logger` subsystem `MLXQwenLLM`, category `kv-reuse`).
 
+Sampling is pinnable: set `parameters.seed` on the request (contract 1.33.0, engine ≥ 0.45.0) and
+the same `(prompt, seed)` reproduces; `nil` — the default — seeds from system entropy, and the
+field is inert at `temperature == 0`. One caveat from the KV reuse above: the guarantee is
+per-**call**, not per-conversation. A pinned one-shot call reproduces outright; pinning turn 5 of
+a held conversation reproduces only after replaying turns 1–4, because the session state is part
+of the input.
+
 ## Live gates
 
 GPU gates run via the CLI (fleet convention — not in the SPM test product):

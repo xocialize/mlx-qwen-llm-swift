@@ -24,9 +24,11 @@ let package = Package(
         .library(name: "MLXQwenLLM", targets: ["MLXQwenLLM"]),
     ],
     dependencies: [
-        // ≥0.27.0: run-lifecycle V4 — the CAN cancellation-conformance gate
-        // (MLXServeConformance CAN-1..3); also carries contract 1.16.0 responseFormat.
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.27.0"),
+        // ≥0.45.0: contract 1.33.0 `LLMParameters.seed` — the canonical RNG pin this package
+        // forwards to GenerateParameters (AB-R-0079). On top of ≥0.27.0's run-lifecycle V4 / CAN
+        // cancellation-conformance gate (MLXServeConformance CAN-1..3) and contract 1.16.0
+        // responseFormat.
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.45.0"),
         // JSON grammar-constrained decoding (the responseFormat runtime, shared with the
         // gemma package).
         .package(url: "https://github.com/xocialize/mlx-constrained-decoding-swift", from: "0.1.0"),

@@ -164,6 +164,19 @@ public final class QwenLLMPackage: ModelPackage {
         if let temperature = llm.parameters.temperature { parameters.temperature = Float(temperature) }
         if let topP = llm.parameters.topP { parameters.topP = Float(topP) }
         parameters.maxTokens = llm.parameters.maxTokens
+        // Contract 1.33.0: the canonical RNG pin. Left nil, mlx-swift-lm seeds the sampler from
+        // system entropy, so a sampling caller cannot reproduce its own run (AB-R-0079 audited
+        // this gap across the `.llm` fleet; AB-A-0009 measured the resulting drift). Set BEFORE
+        // the structured branch so both decode paths carry it, and passed per-`respond` below so
+        // it applies on the KV-reuse path too. Assign only when non-nil rather than writing the
+        // Optional straight through: equivalent today, but not the day mlx-swift-lm changes its
+        // own default. Inert at temperature 0.
+        //
+        // ⚠️ Reproducibility here is per-CALL, not per-conversation: this package holds a
+        // ChatSession across turns, so an identical (prompt, seed) reproduces only from identical
+        // session state. A caller pinning a one-shot side call (the enhancer shape) gets the full
+        // guarantee; a caller pinning turn 5 of a conversation must replay turns 1–4 to see it.
+        if let seed = llm.parameters.seed { parameters.seed = seed }
 
         // Mode → chat-template kwargs. Additive: a `nil` mode injects nothing, so existing
         // callers are byte-for-byte unchanged; only an explicit `.direct`/`.companion`/`.thinking`

@@ -27,6 +27,13 @@
 //       responseFormat. Reported: the measured baseline failure rate WITHOUT responseFormat
 //       (companion-style bracket-scrape parsing) and the per-step masking latency overhead.
 //
+//   swift run -c release RunQwenLLM --seed-gate                 sampling-determinism gate
+//       (contract 1.33.0): the same (prompt, seed) reproduces byte-identically across two
+//       SEPARATE model loads, AND a different seed diverges. Both halves are required — a
+//       reproducibility-only check passes green on a package that ignores the seed entirely,
+//       and on anyone who quietly set temperature to 0. `seed: nil` drift is reported, not
+//       gated (a sampler is allowed to coincide). Seeds default to 10/4242; --seeds A,B.
+//
 //   Optional: --models-root <dir> to point the Hub cache somewhere other than the default
 //   (~/.cache/huggingface/hub, where a prior download already lives on the dev box).
 
@@ -134,6 +141,118 @@ func smoke(cfg: QwenLLMConfiguration) async throws {
     print("[smoke] ---\n\(resp.text.prefix(400))\n[smoke] ---")
     await pkg.unload()
     print(resp.text.isEmpty ? "[smoke] FAIL ❌ (empty)" : "[smoke] PASS ✅")
+}
+
+/// `--seed-gate` — the standing check that `LLMParameters.seed` (contract 1.33.0) actually binds.
+/// PASS requires BOTH halves:
+///
+///   1. **REPRODUCIBILITY** — the same `(prompt, seed)` returns a byte-identical string twice,
+///      across two separate model loads.
+///   2. **DISCRIMINATION** — a DIFFERENT seed returns a different string.
+///
+/// Half 2 is load-bearing. A gate checking only half 1 would pass on a package that ignored the
+/// seed entirely, and would also pass if someone quietly dropped the temperature to 0 — i.e. on
+/// exactly the bug class this field exists to close. Together they say the seed is *read* and *is
+/// the thing that varies*.
+///
+/// Each pass is its own `load()`→`run()`→`unload()`: reproducibility across model RELOADS is the
+/// property a consumer needs, and a check reusing one loaded instance would not prove it. KV reuse
+/// is disabled for the same reason — this gate is about the sampler, and a held session would make
+/// pass 2 a different input from pass 1.
+///
+/// Sampling is the shipping shape (temperature 0.7): the gate asserts existing behaviour is
+/// *pinnable*, not that it changed.
+///
+/// usage: RunQwenLLM --seed-gate [--seeds A,B] [--models-root <dir>]
+@InferenceActor
+func seedGate(cfg: QwenLLMConfiguration, seedA: UInt64, seedB: UInt64) async throws {
+    guard seedA != seedB else {
+        print("[seed-gate] FAIL ❌ seedA and seedB are both \(seedA) — the discrimination half is "
+            + "vacuous with one seed.")
+        exit(2)
+    }
+    let prompt = "Describe a lighthouse keeper climbing the spiral stairs at dawn."
+    let temperature = 0.7
+    let maxTokens = 256
+
+    print("[seed-gate] model      = \(cfg.model.displayName)")
+    print("[seed-gate] prompt     = « \(prompt) »")
+    print(String(format: "[seed-gate] sampling   = temperature %.1f maxTokens=%d · KV reuse OFF",
+                 temperature, maxTokens))
+    print("[seed-gate] seeds      = A=\(seedA) (twice) · B=\(seedB) (once)")
+
+    func pass(_ label: String, seed: UInt64?) async throws -> String {
+        let pkg = QwenLLMPackage(configuration: cfg)
+        pkg.kvCacheReuseEnabled = false
+        try await pkg.load()
+        let t = Date()
+        let resp = try await pkg.run(LLMRequest(
+            messages: [ChatMessage(role: .user, content: prompt)],
+            parameters: LLMParameters(temperature: temperature, maxTokens: maxTokens, seed: seed),
+            mode: .direct)) as! LLMResponse
+        await pkg.unload()
+        print(String(format: "[seed-gate] %@ seed=%@  %6.2fs  %d chars",
+                     label as NSString, (seed.map(String.init) ?? "nil") as NSString,
+                     Date().timeIntervalSince(t), resp.text.count))
+        fflush(stdout)
+        if resp.text.isEmpty {
+            print("[seed-gate] FAIL ❌ \(label) generated nothing — determinism is unmeasurable here.")
+            exit(1)
+        }
+        return resp.text
+    }
+
+    let a1 = try await pass("A1", seed: seedA)
+    let a2 = try await pass("A2", seed: seedA)
+    let b  = try await pass("B ", seed: seedB)
+
+    let reproducible = a1 == a2
+    if reproducible {
+        print("[seed-gate] ✅ REPRODUCIBLE — seed \(seedA) produced a byte-identical string twice, "
+            + "across two separate model loads")
+    } else {
+        let at = zip(a1, a2).prefix { $0 == $1 }.count
+        print("[seed-gate] ❌ NOT reproducible — seed \(seedA) diverged at char \(at) "
+            + "(\(a1.count) vs \(a2.count) chars). The seed is not reaching the sampler, or "
+            + "something upstream of it is nondeterministic.")
+    }
+
+    let discriminates = a1 != b
+    if discriminates {
+        let at = zip(a1, b).prefix { $0 == $1 }.count
+        print("[seed-gate] ✅ DISCRIMINATES — seed \(seedB) produced a different string "
+            + "(first divergence at char \(at), \(a1.count) vs \(b.count) chars)")
+    } else {
+        print("[seed-gate] ❌ NO DISCRIMINATION — seeds \(seedA) and \(seedB) produced the SAME "
+            + "string. The seed is being ignored (or sampling is effectively greedy), and the "
+            + "reproducibility half above is worthless.")
+    }
+
+    // Unpinned control: REPORTED, not gated. A sampler is permitted to coincide, and failing the
+    // build on an unlucky-but-legal repeat would make this flaky. It is here so a green
+    // reproducibility line is never read as "unpinned is safe too".
+    let n1 = try await pass("N1", seed: nil)
+    let n2 = try await pass("N2", seed: nil)
+    let unpinnedDrifts = n1 != n2
+    if unpinnedDrifts {
+        let at = zip(n1, n2).prefix { $0 == $1 }.count
+        print("[seed-gate] ✅ UNPINNED DRIFTS — seed=nil produced two DIFFERENT strings (first "
+            + "divergence at char \(at), \(n1.count) vs \(n2.count) chars): the pin is necessary.")
+    } else {
+        print("[seed-gate] ⚠️ UNPINNED did NOT drift across two runs — possible but unlikely at "
+            + "temperature \(temperature). Do NOT read this as 'unpinned is safe'; re-run first.")
+    }
+
+    let passed = reproducible && discriminates
+    print(String(format: "[seed-gate] SUMMARY reproducible=%@ discriminates=%@ unpinnedDrifts=%@ "
+                        + "seedA=%llu seedB=%llu temperature=%.1f",
+                 (reproducible ? "yes" : "NO") as NSString,
+                 (discriminates ? "yes" : "NO") as NSString,
+                 (unpinnedDrifts ? "yes" : "no") as NSString, seedA, seedB, temperature))
+    print(passed ? "[seed-gate] PASS ✅ sampling is pinnable — same (prompt, seed) reproduces, "
+                    + "different seeds diverge"
+                 : "[seed-gate] FAIL ❌")
+    if !passed { exit(1) }
 }
 
 @InferenceActor
@@ -468,7 +587,14 @@ if let i = args.firstIndex(of: "--models-root"), i + 1 < args.count {
 }
 let cfg = QwenLLMConfiguration(model: .default, modelsRootDirectory: modelsRoot)
 
-if args.contains("--kv-reuse") {
+if args.contains("--seed-gate") {
+    var seeds: (UInt64, UInt64) = (10, 4242)
+    if let i = args.firstIndex(of: "--seeds"), i + 1 < args.count {
+        let parts = args[i + 1].split(separator: ",").compactMap { UInt64($0) }
+        if parts.count == 2 { seeds = (parts[0], parts[1]) }
+    }
+    try await seedGate(cfg: cfg, seedA: seeds.0, seedB: seeds.1)
+} else if args.contains("--kv-reuse") {
     try await kvReuseGate(cfg: cfg)
 } else if args.contains("--mem-bench") {
     try await memBench(cfg: cfg)
@@ -481,7 +607,7 @@ if args.contains("--kv-reuse") {
 } else if args.contains("--smoke") {
     try await smoke(cfg: cfg)
 } else {
-    print("usage: RunQwenLLM --smoke | --kv-reuse | --mem-bench | --structured [--runs N]  [--models-root <dir>]")
+    print("usage: RunQwenLLM --smoke | --kv-reuse | --mem-bench | --structured [--runs N] | --seed-gate [--seeds A,B]  [--models-root <dir>]")
     print("  model: \(QwenModel.default.displayName) via \(QwenModel.default.weightsRepo ?? "?")")
     print("  weights default to the standard Hub cache (~/.cache/huggingface/hub)")
 }

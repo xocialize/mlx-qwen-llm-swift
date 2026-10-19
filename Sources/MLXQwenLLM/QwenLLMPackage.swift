@@ -180,7 +180,8 @@ public final class QwenLLMPackage: ModelPackage {
 
         // Mode → chat-template kwargs. Additive: a `nil` mode injects nothing, so existing
         // callers are byte-for-byte unchanged; only an explicit `.direct`/`.companion`/`.thinking`
-        // sets `enable_thinking` on the Qwen3.5 hybrid-reasoner template.
+        // (or `promptEnhance`, which answers directly) sets `enable_thinking` on the Qwen3.5
+        // hybrid-reasoner template.
         let templateContext = Self.templateContext(for: llm.mode)
 
         // Structured output (contract 1.16.0): bypass ChatSession entirely — mlx-swift-lm
@@ -422,14 +423,23 @@ public final class QwenLLMPackage: ModelPackage {
     /// `.direct`/`.companion` disable thinking, `.thinking` enables it. A `nil` (or any other)
     /// mode returns `nil` so nothing is injected — keeping the change additive for callers that
     /// don't opt in. `enable_thinking` is the Qwen-family kwarg; other families would map their own.
-    private nonisolated static func templateContext(for mode: Mode?) -> [String: any Sendable]? {
+    ///
+    /// `promptEnhance` (prompt-enhance-kit's mode tag) disables thinking too: an enhancer's answer IS
+    /// the prompt the image or video model reads, so a reasoning preamble would become the prompt.
+    /// Measured on Qwen3.5-4B int4 with prompt-enhance-kit's image profiles: with the template's default,
+    /// every answer opened with a "Thinking Process:" trace of 2–3k characters (AB-D-0155, E1 gate).
+    nonisolated static func templateContext(for mode: Mode?) -> [String: any Sendable]? {
         guard let mode else { return nil }
         switch mode {
-        case .direct, .companion: return ["enable_thinking": false]
-        case .thinking:           return ["enable_thinking": true]
-        default:                  return nil
+        case .direct, .companion, Self.promptEnhanceMode: return ["enable_thinking": false]
+        case .thinking:                                     return ["enable_thinking": true]
+        default:                                            return nil
         }
     }
+
+    /// prompt-enhance-kit's `Mode.promptEnhance`, spelled here so the package doesn't depend on the kit.
+    nonisolated static let promptEnhanceMode: Mode = "promptEnhance"
+
 }
 
 /// The held cross-`run` `ChatSession` plus the exact transcript its KV cache encodes.

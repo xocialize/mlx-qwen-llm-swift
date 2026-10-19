@@ -31,3 +31,22 @@ import MLXToolKit
         _ = try await package.run(LLMRequest(prompt: "Hello"))
     }
 }
+
+// MARK: - Mode → chat-template kwargs
+
+private func thinking(_ mode: Mode?) -> Bool? {
+    QwenLLMPackage.templateContext(for: mode)?["enable_thinking"] as? Bool
+}
+
+@Test func promptEnhanceAnswersWithoutThinking() {
+    // An enhancer's answer is the prompt the image or video model reads: no reasoning preamble.
+    #expect(thinking("promptEnhance") == false)
+}
+
+@Test func existingModesKeepTheirThinkingSetting() {
+    #expect(thinking(.direct) == false)
+    #expect(thinking(.companion) == false)
+    #expect(thinking(.thinking) == true)
+    #expect(QwenLLMPackage.templateContext(for: nil) == nil)
+    #expect(QwenLLMPackage.templateContext(for: "something-else") == nil)
+}

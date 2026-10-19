@@ -58,3 +58,39 @@ public struct QwenLLMConfiguration: PackageConfiguration, ModelStorable, Footpri
         case model, revision, memoryBudgetBytes
     }
 }
+
+// MARK: - Weight sources (the gemma package's MAT pattern)
+
+extension QwenLLMConfiguration: WeightSourcing {
+    /// One source: the configured checkpoint's repo. Without it the engine stamped its install
+    /// marker on the static manifest's `provenance.sourceRepo` (the 0.8B default) whatever
+    /// checkpoint loaded, and `needsDownload` read that same marker (AB-A-0195). Declared, the
+    /// engine marks the repo that actually loaded and `needsDownload` probes it (MS-6). The quant
+    /// is tiered by repo (`Qwen3.5-<size>-MLX-<quant>`), so `matching` stays nil: the whole
+    /// snapshot. Unpublished quants (`weightsRepo == nil`) declare nothing; `load()` rejects them.
+    ///
+    /// `missingWeightSources` is the engine's default probe (MS-2): the hub snapshot
+    /// (`models--<org>--<name>/snapshots/<commit>/`, what this package's own download writes) or
+    /// the engine-executed flat layout (`models--<org>--<name>/`, contract 1.24).
+    public var weightSources: [WeightSource] {
+        guard let repo = weightsRepo else { return [] }
+        return [WeightSource(role: "checkpoint", repo: repo, revision: revision)]
+    }
+
+    /// Where `load()` reads a materialized checkpoint from under `storeRoot`, judged by the same
+    /// probe as `missingWeightSources`: the hub snapshot when it satisfies the source, else the
+    /// flat repo directory when that does. `nil` when neither does (or there's no store), so
+    /// `load()` downloads it.
+    public func resolvedModelDirectory(storeRoot: URL?) -> URL? {
+        guard let repo = weightsRepo else { return nil }
+        let store = ModelStore(root: storeRoot)
+        if let snapshot = store.snapshotDirectory(for: repo, revision: revision),
+           WeightSourceProbe.snapshot(snapshot, satisfies: nil) {
+            return snapshot
+        }
+        if let flat = store.directory(for: repo), WeightSourceProbe.flatDirectory(flat, satisfies: nil) {
+            return flat
+        }
+        return nil
+    }
+}

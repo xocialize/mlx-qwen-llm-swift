@@ -37,6 +37,10 @@ swift run -c release RunQwenLLM --mem-bench    # split-footprint + held-KV reten
 
 `QwenModel.allPublished` catalogs the supported Qwen3.5 sizes × quants; consumers select one
 through `QwenLLMConfiguration`. Weights download on first use from the configured Hugging Face repo.
+The configuration declares that checkpoint as its `WeightSource` (since 0.6.2), so with a models folder the engine
+downloads it into `models--<org>--<name>/` when it's missing, stamps its install marker on that repo, and
+`needsDownload` probes that repo; `load()` reads the hub snapshot or the engine's flat layout from there. Before 0.6.2
+the marker went to the manifest's static repo (the 0.8B default) whatever checkpoint loaded.
 
 ## Usage
 

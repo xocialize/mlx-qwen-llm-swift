@@ -109,9 +109,11 @@ public final class QwenLLMPackage: ModelPackage {
 
     /// Page the working set in. Idempotent when already resident.
     ///
-    /// Loads via mlx-swift-lm's HF loader, which downloads + caches the weights and dispatches
-    /// to the matching factory (MLXLLM or MLXVLM) by the model's `config.json`. Phase 3 will
-    /// redirect the download into the engine-chosen models folder.
+    /// Loads via mlx-swift-lm's HF loader, which dispatches to the matching factory (MLXLLM or
+    /// MLXVLM) by the model's `config.json`. With a models folder, a checkpoint already in it
+    /// loads from there: the hub snapshot this package's download writes, or the flat layout the
+    /// engine's materializer writes for the declared `WeightSource` (contract 1.24) before
+    /// `load()`. Otherwise it downloads into the folder's hub cache, or the default one.
     public func load() async throws {
         guard container == nil else { return }
         guard let repo = configuration.weightsRepo else {
@@ -120,7 +122,10 @@ public final class QwenLLMPackage: ModelPackage {
                 got: configuration.model.displayName)
         }
         let revision = configuration.revision ?? "main"
-        if let root = configuration.modelsRootDirectory {
+        if let dir = configuration.resolvedModelDirectory(storeRoot: configuration.modelsRootDirectory) {
+            container = try await #huggingFaceLoadModelContainer(
+                configuration: ModelConfiguration(directory: dir))
+        } else if let root = configuration.modelsRootDirectory {
             // Materialize into the engine-chosen models folder (caller holds security-scoped
             // access) by pointing the Hub cache there, instead of the default container cache.
             let client = HubClient(cache: HubCache(cacheDirectory: root))

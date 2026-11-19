@@ -28,15 +28,21 @@ let package = Package(
         // forwards to GenerateParameters (AB-R-0079). On top of ≥0.27.0's run-lifecycle V4 / CAN
         // cancellation-conformance gate (MLXServeConformance CAN-1..3) and contract 1.16.0
         // responseFormat.
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.45.0"),
+        // ≥0.82.1: Quant.mxfp8/.nvfp4 (contract 1.60.0, engine 0.75.0) are named in QwenModel's
+        // exhaustive switches, and mlx-swift comes from the fleet's 0.33.1 fork (AB-D-0264).
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.82.1"),
         // JSON grammar-constrained decoding (the responseFormat runtime, shared with the
         // gemma package).
         .package(url: "https://github.com/xocialize/mlx-constrained-decoding-swift", from: "0.1.0"),
         // MLX-Swift LM runtime (https://github.com/ml-explore/mlx-swift-lm):
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.3")),
-        // mlx-swift, for MLX.Memory.clearCache() in the wrapper's unload(). Pinned to the
-        // revision mlx-swift-lm already resolves (0.31.5) so this adds no new resolution churn.
-        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.5"),
+        // 3.33.0 is the first release on mlx-swift 0.33, which the fork below needs.
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.33.0")),
+        // mlx-swift from the fleet's fork: 0.33.1 = upstream 0.33.0 with the vendored MLX's M5
+        // head-dim-split attention routes disabled (AB-R-1009, AB-D-0264). Upstream 0.33.0 aborts
+        // on M5 for head-256 masked prefills of 1024+ tokens (Qwen 3.5 class models, head dim 256, hit it). This line is the ROOT
+        // declaration when the package builds on its own, so it has to name the fork; same
+        // package identity as ml-explore's. Back to upstream once a release gates clean.
+        .package(url: "https://github.com/xocialize/mlx-swift", from: "0.33.1"),
         // mlx-swift-lm 3.x decoupled the HF stack — the download macro/tokenizer needs these
         // provided by the consumer. Versions pinned to a known-good resolved set.
         .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
